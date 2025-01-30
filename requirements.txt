@@ -1,0 +1,9 @@
+pymongo[srv]==3.11
+python-telegram-bot==13.15
+google-generativeai
+pillow~=11.1.0
+PyPDF2~=3.0.1
+requests~=2.32.3
+google-search-results~=2.4.2
+python-dotenv~=1.0.1
+protobuf~=5.29.3

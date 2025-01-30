@@ -127,14 +127,19 @@ def document_handler(update: Update, context: CallbackContext):
         file = document.get_file()
         file_name = document.file_name
 
-        # Download file
+        # Download the file
         file_bytes = file.download_as_bytearray()
 
-        # Extract text from PDF
+        # Read PDF from bytes
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
         text = ''
-        for page_num in range(pdf_reader.getNumPages()):
-            text += pdf_reader.getPage(page_num).extractText()
+
+        # Use new method to get the number of pages and extract text
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text
 
         # Generate description using Gemini API
         response = model.generate_content(f"Summarize the following document: {text}")
