@@ -6,6 +6,7 @@ import PyPDF2
 import dotenv as dotenv
 import requests
 import os
+from collections import defaultdict
 import google.generativeai as genai
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
@@ -33,6 +34,9 @@ db = client['telegram_bot_db']
 users_collection = db['users']
 chats_collection = db['chats']
 files_collection = db['files']
+
+chat_history = defaultdict(list)
+MAX_HISTORY_LENGTH = 10  # Maximum number of messages to keep in context
 
 def start(update: Update, context: CallbackContext):
     user = update.effective_user
@@ -71,20 +75,48 @@ def contact_handler(update: Update, context: CallbackContext):
     else:
         update.message.reply_text("Please share your contact number by pressing the button.")
 
+
 def chat_handler(update: Update, context: CallbackContext):
     user_message = update.message.text
     chat_id = update.effective_chat.id
 
+    # Get chat history for this user
+    user_history = chat_history[chat_id]
+
+    # Create context-aware prompt
+    context_messages = "\n".join([
+        f"{'User' if i % 2 == 0 else 'Assistant'}: {msg}"
+        for i, msg in enumerate(user_history[-MAX_HISTORY_LENGTH:])
+    ])
+
+    full_prompt = f"""Previous conversation:
+    {context_messages}
+
+    User: {user_message}
+
+    Please provide a response that takes into account the conversation history above."""
+
     # Generate response using Gemini API
-    response = model.generate_content(user_message)
+    response = model.generate_content(full_prompt)
     bot_response = response.text
 
-    # Save chat history
+    # Update chat history
+    user_history.append(user_message)
+    user_history.append(bot_response)
+
+    # Trim history if too long
+    if len(user_history) > MAX_HISTORY_LENGTH * 2:
+        user_history = user_history[-MAX_HISTORY_LENGTH * 2:]
+
+    chat_history[chat_id] = user_history
+
+    # Save chat history to MongoDB
     conversation_entry = {
         'chat_id': chat_id,
         'timestamp': datetime.utcnow(),
         'user_message': user_message,
-        'bot_response': bot_response
+        'bot_response': bot_response,
+        'context': context_messages
     }
     chats_collection.insert_one(conversation_entry)
 
@@ -118,6 +150,11 @@ def image_handler(update: Update, context: CallbackContext):
 
     # Reply to user
     update.message.reply_text(description)
+
+def clear_history(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    chat_history[chat_id] = []
+    update.message.reply_text("Conversation history has been cleared.")
 
 def document_handler(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -160,66 +197,103 @@ def document_handler(update: Update, context: CallbackContext):
         update.message.reply_text("Unsupported file type.")
 
 def websearch_command(update: Update, context: CallbackContext):
-    update.message.reply_text("Please enter your web search query:")
-    return 'WEBSEARCH'
+    # Get the query from the message text after '/websearch'
+    query = ' '.join(context.args)  # This gets all text after the command
 
-def websearch_query_handler(update: Update, context: CallbackContext):
-    query = update.message.text
+    if not query:
+        update.message.reply_text("Please provide a search query. Usage: /websearch your query here")
+        return
+
     chat_id = update.effective_chat.id
 
-    # Perform web search using SerpAPI
-    params = {
-        "q": query,
-        "hl": "en",
-        "gl": "us",
-        "api_key": SERPAPI_API_KEY
-    }
+    # Inform user that search is in progress
+    update.message.reply_text("🔍 Searching the web for: " + query)
 
-    search = GoogleSearch(params)
-    results = search.get_dict()
+    try:
+        # 1. Perform web search using SerpAPI
+        params = {
+            "q": query,
+            "hl": "en",
+            "gl": "us",
+            "api_key": SERPAPI_API_KEY,
+            "num": 5,
+            "sort": "date"
+        }
 
-    # Extract top results
-    search_results = []
-    if 'organic_results' in results:
-        for item in results['organic_results'][:3]:
-            title = item.get('title')
-            link = item.get('link')
-            snippet = item.get('snippet', '')
-            search_results.append({'title': title, 'link': link, 'snippet': snippet})
-    else:
-        update.message.reply_text("No results found.")
-        return -1
+        search = GoogleSearch(params)
+        results = search.get_dict()
 
-    # Generate summary using Gemini API
-    combined_results = "\n".join([f"{item['title']}: {item['snippet']}" for item in search_results])
-    prompt = f"Please summarize the following search results for '{query}':\n{combined_results}"
-    response = model.generate_content(prompt)
-    summary = response.text
+        if 'organic_results' not in results or not results['organic_results']:
+            update.message.reply_text("No search results found.")
+            return
 
-    # Reply to user
-    response_text = f"Summary:\n{summary}\n\nTop links:\n"
-    for item in search_results:
-        response_text += f"{item['title']}: {item['link']}\n"
+        # 2. Process and format search results
+        search_results = []
+        for item in results['organic_results'][:5]:
+            search_results.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'snippet': item.get('snippet', ''),
+                'date': item.get('date', '')
+            })
 
-    update.message.reply_text(response_text)
+        # 3. Prepare search results for Gemini
+        formatted_results = "\n\n".join([
+            f"Title: {result['title']}\n"
+            f"Summary: {result['snippet']}\n"
+            f"URL: {result['link']}"
+            for result in search_results
+        ])
 
-    # Save conversation
-    conversation_entry = {
-        'chat_id': chat_id,
-        'timestamp': datetime.utcnow(),
-        'user_query': query,
-        'bot_response': summary,
-        'search_results': search_results
-    }
-    chats_collection.insert_one(conversation_entry)
+        # 4. Generate summary using Gemini
+        prompt = f"""Based on these web search results for '{query}':
 
-    return -1
+{formatted_results}
+
+Please provide:
+1. A comprehensive summary of the information
+2. Key points or findings
+3. Any relevant dates or timeline
+"""
+
+        # 5. Get Gemini's response
+        response = model.generate_content(prompt)
+        summary = response.text
+
+        # 6. Format final response
+        final_response = f"🔍 Search Results for: {query}\n\n"
+        final_response += f"📝 AI Summary:\n{summary}\n\n"
+        final_response += "🔗 Sources:\n"
+        for result in search_results:
+            final_response += f"• {result['title']}\n  {result['link']}\n"
+
+        # 7. Send response in chunks if too long
+        if len(final_response) > 4096:
+            for i in range(0, len(final_response), 4096):
+                update.message.reply_text(final_response[i:i + 4096])
+        else:
+            update.message.reply_text(final_response)
+
+        # 8. Save to database
+        conversation_entry = {
+            'chat_id': chat_id,
+            'timestamp': datetime.utcnow(),
+            'query': query,
+            'search_results': search_results,
+            'summary': summary
+        }
+        chats_collection.insert_one(conversation_entry)
+
+    except Exception as e:
+        logging.error(f"Error in websearch: {str(e)}")
+        update.message.reply_text(f"An error occurred while processing your search: {str(e)}")
 
 def help_command(update: Update, context: CallbackContext):
     help_text = (
         "Here are the available commands and how to use the bot:\n\n"
         "/start - Register yourself with the bot and share your contact number.\n"
         "/help - Display this help message.\n"
+        "/clear - clear chat history.\n"
         "/websearch - Perform a web search and get an AI-generated summary with top web links.\n\n"
         "Other interactions:\n"
         "- Send any text message to chat with the AI.\n"
@@ -236,6 +310,7 @@ def main():
     # Start command handler
     dp.add_handler(CommandHandler('start', start))
     dp.add_handler(CommandHandler('help', help_command))
+    dp.add_handler(CommandHandler('clear', clear_history))
 
     # Contact handler
     dp.add_handler(MessageHandler(Filters.contact, contact_handler))
@@ -250,15 +325,7 @@ def main():
     dp.add_handler(MessageHandler(Filters.document, document_handler))
 
     # Web search conversation handler
-    websearch_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('websearch', websearch_command)],
-        states={
-            'WEBSEARCH': [MessageHandler(Filters.text & ~Filters.command, websearch_query_handler)]
-        },
-        fallbacks=[],
-        allow_reentry=True
-    )
-    dp.add_handler(websearch_conv_handler)
+    dp.add_handler(CommandHandler('websearch', websearch_command, pass_args=True))
     # Start the bot
     updater.start_polling()
     updater.idle()
