@@ -129,10 +129,6 @@ The bot uses MongoDB with the following collections:
 4. Push to the branch
 5. Create a Pull Request
 
-## License
-
-[Add your license information here]
-
 ## Acknowledgments
 
 - Google Gemini AI for natural language processing
